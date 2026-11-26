@@ -1,0 +1,319 @@
+export const MAX_MESSAGE_BYTES = 8_192
+export const MAX_SESSION_ID_LENGTH = 128
+export const MAX_REASON_LENGTH = 500
+
+export class ValidationError extends Error {
+  readonly field: string
+
+  constructor(field: string, message: string) {
+    super(message)
+    this.name = "ValidationError"
+    this.field = field
+  }
+}
+
+function record(value: unknown, field: string): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new ValidationError(field, `${field} must be an object`)
+  }
+  return value as Record<string, unknown>
+}
+
+function text(value: unknown, field: string, maxLength: number): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new ValidationError(field, `${field} must be a non-empty string`)
+  }
+  if ([...value].length > maxLength || /[\u0000-\u001f\u007f]/.test(value)) {
+    throw new ValidationError(field, `${field} is invalid or too long`)
+  }
+  return value
+}
+
+function sessionID(value: unknown, field = "sessionID"): string {
+  const id = text(value, field, MAX_SESSION_ID_LENGTH)
+  if (!/^ses_[A-Za-z0-9_-]+$/.test(id)) {
+    throw new ValidationError(field, `${field} must be a valid session ID`)
+  }
+  return id
+}
+
+function optionalText(
+  value: unknown,
+  field: string,
+  maxLength: number,
+): string | undefined {
+  if (value === undefined) return undefined
+  return text(value, field, maxLength)
+}
+
+function integer(value: unknown, field: string, min: number, max: number): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < min || value > max) {
+    throw new ValidationError(field, `${field} must be an integer from ${min} to ${max}`)
+  }
+  return value
+}
+
+export interface SessionSendInput {
+  targetSessionID: string
+  text: string
+  conversationID?: string
+  inReplyToMessageID?: string
+  intent: string
+  delivery: "steer" | "queue"
+  idempotencyKey?: string
+  waitForReply: boolean
+}
+
+export function parseSessionSendInput(value: unknown, callerSessionID: string): SessionSendInput {
+  const input = record(value, "input")
+  const targetSessionID = sessionID(input.targetSessionID, "targetSessionID")
+  if (typeof input.text !== "string" || input.text.trim().length === 0) {
+    throw new ValidationError("text", "text must be a non-empty string")
+  }
+  if (new TextEncoder().encode(input.text).byteLength > MAX_MESSAGE_BYTES) {
+    throw new ValidationError("text", `message exceeds ${MAX_MESSAGE_BYTES} UTF-8 bytes`)
+  }
+
+  const conversationID = optionalText(input.conversationID, "conversationID", 256)
+  const inReplyToMessageID = optionalText(input.inReplyToMessageID, "inReplyToMessageID", 256)
+  const idempotencyKey = optionalText(input.idempotencyKey, "idempotencyKey", 128)
+  const intent = input.intent === undefined ? "message" : text(input.intent, "intent", 64)
+  const delivery = input.delivery === undefined ? "queue" : input.delivery
+  if (delivery !== "steer" && delivery !== "queue") {
+    throw new ValidationError("delivery", "delivery must be steer or queue")
+  }
+  const waitForReply = input.waitForReply === undefined ? false : input.waitForReply
+  if (typeof waitForReply !== "boolean") {
+    throw new ValidationError("waitForReply", "waitForReply must be a boolean")
+  }
+  if (waitForReply && targetSessionID === callerSessionID) {
+    throw new ValidationError("waitForReply", "waitForReply is not allowed for self-messaging")
+  }
+
+  return {
+    targetSessionID,
+    text: input.text,
+    ...(conversationID === undefined ? {} : { conversationID }),
+    ...(inReplyToMessageID === undefined ? {} : { inReplyToMessageID }),
+    intent,
+    delivery: waitForReply ? "steer" : delivery,
+    ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
+    waitForReply,
+  }
+}
+
+export interface SessionListInput {
+  limit: number
+  order: "asc" | "desc"
+  search?: string
+  cursor?: string
+  directory?: string
+  project?: string
+}
+
+export function parseSessionListInput(value: unknown): SessionListInput {
+  const input = record(value, "input")
+  const limit = input.limit === undefined ? 50 : integer(input.limit, "limit", 1, 200)
+  const order = input.order === undefined ? "desc" : input.order
+  if (order !== "asc" && order !== "desc") {
+    throw new ValidationError("order", "order must be asc or desc")
+  }
+  return {
+    limit,
+    order,
+    ...(input.search === undefined ? {} : { search: text(input.search, "search", 256) }),
+    ...(input.cursor === undefined ? {} : { cursor: text(input.cursor, "cursor", 2_048) }),
+    ...(input.directory === undefined ? {} : { directory: text(input.directory, "directory", 4_096) }),
+    ...(input.project === undefined ? {} : { project: text(input.project, "project", 256) }),
+  }
+}
+
+export interface SessionReadInput {
+  sessionID: string
+  limit: number
+  maxCharsPerMessage: number
+  maxTotalChars: number
+}
+
+export function parseSessionReadInput(value: unknown): SessionReadInput {
+  const input = record(value, "input")
+  return {
+    sessionID: sessionID(input.sessionID),
+    limit: input.limit === undefined ? 50 : integer(input.limit, "limit", 1, 200),
+    maxCharsPerMessage:
+      input.maxCharsPerMessage === undefined
+        ? 4_000
+        : integer(input.maxCharsPerMessage, "maxCharsPerMessage", 1, 20_000),
+    maxTotalChars:
+      input.maxTotalChars === undefined
+        ? 16_000
+        : integer(input.maxTotalChars, "maxTotalChars", 1, 100_000),
+  }
+}
+
+export interface SessionDeleteInput {
+  sessionID: string
+  confirmSessionID: string
+  reason: string
+}
+
+export function parseSessionDeleteInput(value: unknown): SessionDeleteInput {
+  const input = record(value, "input")
+  const id = sessionID(input.sessionID)
+  const confirmation = sessionID(input.confirmSessionID, "confirmSessionID")
+  if (id !== confirmation) {
+    throw new ValidationError("confirmSessionID", "confirmSessionID must equal sessionID")
+  }
+  if (typeof input.reason !== "string" || input.reason.trim().length === 0) {
+    throw new ValidationError("reason", "reason must be a non-empty string")
+  }
+  if ([...input.reason].length > MAX_REASON_LENGTH || /[\u0000-\u001f\u007f]/.test(input.reason)) {
+    throw new ValidationError("reason", `reason must be at most ${MAX_REASON_LENGTH} characters`)
+  }
+  return { sessionID: id, confirmSessionID: confirmation, reason: input.reason }
+}
+
+export function parseSessionInterruptInput(value: unknown): {
+  sessionID: string
+  resume: boolean
+} {
+  const input = record(value, "input")
+  const resume = input.resume === undefined ? false : input.resume
+  if (typeof resume !== "boolean") {
+    throw new ValidationError("resume", "resume must be a boolean")
+  }
+  return { sessionID: sessionID(input.sessionID), resume }
+}
+
+export function parseSessionWaitInput(value: unknown): { sessionID: string } {
+  const input = record(value, "input")
+  return { sessionID: sessionID(input.sessionID) }
+}
+
+export interface SessionModelInput {
+  providerID: string
+  id: string
+  variant?: string
+}
+
+export interface SessionPermissionInput {
+  action: string
+  resource: string
+  effect: "allow" | "deny" | "ask"
+}
+
+export interface SessionCreateInput {
+  title: string
+  directory?: string
+  workdir?: string
+  model?: SessionModelInput
+  agent?: string
+  initialPrompt?: string
+  autoApprove: boolean
+  permissions?: SessionPermissionInput[]
+}
+
+function relativeDirectory(value: unknown, field: string): string {
+  const directory = text(value, field, 4_096)
+  if (directory.startsWith("/") || /^[A-Za-z]:[\\/]/.test(directory)) {
+    throw new ValidationError(field, `${field} must be relative`)
+  }
+  if (directory.split(/[/\\]+/).includes("..")) {
+    throw new ValidationError(field, `${field} must not contain parent traversal`)
+  }
+  return directory
+}
+
+function modelRef(value: unknown): SessionModelInput {
+  const input = record(value, "model")
+  return {
+    providerID: text(input.providerID, "providerID", 128),
+    id: text(input.id, "id", 128),
+    ...(input.variant === undefined ? {} : { variant: text(input.variant, "variant", 128) }),
+  }
+}
+
+function permissionRules(value: unknown): SessionPermissionInput[] {
+  if (!Array.isArray(value)) throw new ValidationError("permissions", "permissions must be an array")
+  return value.map((rule, index) => {
+    const item = record(rule, `permissions[${index}]`)
+    const effect = item.effect
+    if (effect !== "allow" && effect !== "deny" && effect !== "ask") {
+      throw new ValidationError("permissions", "permission effect must be allow, deny, or ask")
+    }
+    return {
+      action: text(item.action, "action", 128),
+      resource: text(item.resource, "resource", 4_096),
+      effect,
+    }
+  })
+}
+
+export function parseSessionCreateInput(value: unknown): SessionCreateInput {
+  const input = record(value, "input")
+  const autoApprove = input.autoApprove === undefined ? false : input.autoApprove
+  if (typeof autoApprove !== "boolean") {
+    throw new ValidationError("autoApprove", "autoApprove must be a boolean")
+  }
+
+  let initialPrompt: string | undefined
+  if (input.initialPrompt !== undefined) {
+    if (
+      typeof input.initialPrompt !== "string" ||
+      input.initialPrompt.trim().length === 0 ||
+      new TextEncoder().encode(input.initialPrompt).byteLength > MAX_MESSAGE_BYTES
+    ) {
+      throw new ValidationError("initialPrompt", "initialPrompt must be a bounded non-empty string")
+    }
+    initialPrompt = input.initialPrompt
+  }
+
+  const title = input.title === undefined ? `Session ${Date.now()}` : text(input.title, "title", 120)
+  const directory = input.directory === undefined ? undefined : relativeDirectory(input.directory, "directory")
+  const workdir = input.workdir === undefined ? undefined : relativeDirectory(input.workdir, "workdir")
+
+  return {
+    title,
+    ...(directory === undefined ? {} : { directory }),
+    ...(workdir === undefined ? {} : { workdir }),
+    ...(input.model === undefined ? {} : { model: modelRef(input.model) }),
+    ...(input.agent === undefined ? {} : { agent: text(input.agent, "agent", 128) }),
+    ...(initialPrompt === undefined ? {} : { initialPrompt }),
+    autoApprove,
+    ...(input.permissions === undefined ? {} : { permissions: permissionRules(input.permissions) }),
+  }
+}
+
+export interface SessionCleanupInput {
+  reason: string
+  sessionIDs?: string[]
+  dryRun: boolean
+  maxAgeMs?: number
+}
+
+export function parseSessionCleanupInput(value: unknown): SessionCleanupInput {
+  const input = record(value, "input")
+  const reason = text(input.reason, "reason", MAX_REASON_LENGTH)
+  const dryRun = input.dryRun === undefined ? false : input.dryRun
+  if (typeof dryRun !== "boolean") throw new ValidationError("dryRun", "dryRun must be a boolean")
+
+  let sessionIDs: string[] | undefined
+  if (input.sessionIDs !== undefined) {
+    if (!Array.isArray(input.sessionIDs)) {
+      throw new ValidationError("sessionIDs", "sessionIDs must be an array")
+    }
+    sessionIDs = input.sessionIDs.map((id, index) => sessionID(id, `sessionIDs[${index}]`))
+  }
+
+  let maxAgeMs: number | undefined
+  if (input.maxAgeMs !== undefined) {
+    maxAgeMs = integer(input.maxAgeMs, "maxAgeMs", 1, 2_147_483_647)
+  }
+
+  return {
+    reason,
+    ...(sessionIDs === undefined ? {} : { sessionIDs }),
+    dryRun,
+    ...(maxAgeMs === undefined ? {} : { maxAgeMs }),
+  }
+}

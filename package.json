@@ -1,0 +1,47 @@
+{
+  "name": "opencode-session-bridge",
+  "version": "1.1.0",
+  "description": "Direct, permission-aware communication between OpenCode V2 sessions.",
+  "license": "MIT",
+  "type": "module",
+  "private": false,
+  "packageManager": "bun@1.4.5",
+  "engines": {
+    "node": ">=22"
+  },
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "build": "bun build src/index.ts --target=node --format=esm --outdir=dist",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "test:coverage": "bun test --coverage",
+    "audit": "bun audit",
+    "prepublishOnly": "bun run build && bun run typecheck && bun test && bun run test:coverage && bun audit"
+  },
+  "devDependencies": {
+    "@opencode/client": "2.4.1",
+    "@opencode/plugin": "2.4.1",
+    "@opencode/schema": "2.4.1",
+    "@types/bun": "^1.4.5",
+    "typescript": "5.9.3"
+  },
+  "overrides": {
+    "glob": "14.0.2",
+    "minimatch": "11.0.1"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
