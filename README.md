@@ -91,7 +91,13 @@ Use `intent: "task"` with a `conversationID` for delegated work. The call is non
 6. Session B runs the task. It does not need a special tool call to report completion.
 7. When Session B finishes, the plugin sends one completion prompt to Session A. The primary signal is the `experimental.idle` session hook. `session.idle`, `session.deleted`, `session.execution.failed`, and `session.execution.interrupted` events are a fallback for runtimes that forward them.
 
-The completion prompt targets the origin session and reuses the task conversation ID. Its metadata contains:
+The completion prompt targets the origin session and reuses the task conversation ID. Before sending it, the plugin reads the target's latest assistant text with `ctx.session.context`. This is a server-side read. It is not a wait and it is not performed by the origin.
+
+The prompt text carries the result in a `<session_bridge_result>` block. The result is redacted and bounded. If the target produced no text, the block says so. The origin can use this result to continue work without polling.
+
+Multi-hop handoffs work the same way. When B receives a completion from C and then finishes, B's latest answer becomes the result sent to A.
+
+Its metadata contains:
 
 - `session_bridge_completion: true`
 - `opencode_session_bridge.intent: "completion"`
@@ -100,6 +106,8 @@ The completion prompt targets the origin session and reuses the task conversatio
 - `opencode_session_bridge.from_session` — the target session
 - `opencode_session_bridge.to_session` — the origin session
 - `opencode_session_bridge.completion_status` — `completed`, `failed`, `cancelled`, or `stale`
+- `opencode_session_bridge.has_result`
+- `opencode_session_bridge.result_preview`
 - `opencode_session_bridge.sent_at`
 
 Completion status mapping:
@@ -142,7 +150,7 @@ bun test
 bun run test:coverage
 ```
 
-Current coverage is 100% for functions and 99.51% for lines.
+Current coverage is 100% for functions and 99.50% for lines.
 
 `bun audit` reports no known vulnerabilities.
 

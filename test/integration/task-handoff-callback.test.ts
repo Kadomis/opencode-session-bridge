@@ -1,6 +1,8 @@
 import { describe, expect, it } from "bun:test"
 import {
+  makeAssistantMessage,
   makeToolContext,
+  makeUserMessage,
   outputOf,
   setupBridge,
   type FakeBridgeEvent,
@@ -200,14 +202,18 @@ describe("task handoff completion callbacks", () => {
     )
   })
 
-  it("never polls or reads target context during the handoff lifecycle", async () => {
+  it("never waits on the target during the handoff lifecycle", async () => {
     const bridge = await setupBridge(bridgeOptions())
     await sendTask(bridge)
+    expect(bridge.session.context).not.toHaveBeenCalled()
+
     bridge.event.emit(makeEvent("session.idle", "ses_target"))
     await eventually(() => completionInputs(bridge).length, (count) => count > 0, "completion callback")
 
     expect(bridge.session.wait).not.toHaveBeenCalled()
-    expect(bridge.session.context).not.toHaveBeenCalled()
+    // The plugin reads target context once to collect the result for the
+    // origin. The origin performs no polling or read of its own.
+    expect(bridge.session.context).toHaveBeenCalledTimes(1)
   })
 
   it("does not create another handoff or a callback storm from completion traffic", async () => {
@@ -334,8 +340,56 @@ describe("task handoff completion callbacks", () => {
       }),
     )
     expect(bridge.session.wait).not.toHaveBeenCalled()
-    expect(bridge.session.context).not.toHaveBeenCalled()
+    expect(bridge.session.context).toHaveBeenCalledTimes(1)
     expect(bridge.sessionHook).toHaveBeenCalledWith("experimental.idle", expect.any(Function))
+  })
+
+  it("carries the target's final output to the origin", async () => {
+    const bridge = await setupBridge(bridgeOptions(), { sessionHook: true })
+    bridge.setContextMessages([
+      makeAssistantMessage("msg_answer", [{ type: "text", text: "RESULT_FROM_TARGET" }]),
+    ])
+    await sendTask(bridge)
+
+    await bridge.emitSessionIdle("ses_target")
+    await eventually(() => completionInputs(bridge).length, (count) => count > 0, "result callback")
+
+    expect(completionInputs(bridge)[0]?.text).toContain("RESULT_FROM_TARGET")
+    expect(completionInputs(bridge)[0]?.metadata?.opencode_session_bridge).toEqual(
+      expect.objectContaining({ has_result: true, result_preview: "RESULT_FROM_TARGET" }),
+    )
+  })
+
+  it("redacts secrets in the carried result", async () => {
+    const bridge = await setupBridge(bridgeOptions(), { sessionHook: true })
+    bridge.setContextMessages([
+      makeAssistantMessage("msg_secret", [
+        { type: "text", text: "Use sk-abcdefghijklmnopqrstuvwxyz123456 for access" },
+      ]),
+    ])
+    await sendTask(bridge)
+
+    await bridge.emitSessionIdle("ses_target")
+    await eventually(() => completionInputs(bridge).length, (count) => count > 0, "redacted result")
+
+    const text = completionInputs(bridge)[0]?.text ?? ""
+    expect(text).toContain("[REDACTED]")
+    expect(text).not.toContain("sk-abcdefghijklmnopqrstuvwxyz123456")
+  })
+
+  it("returns the last answer after an upstream completion in a multi-hop handoff", async () => {
+    const bridge = await setupBridge(bridgeOptions(), { sessionHook: true })
+    bridge.setContextMessages([
+      makeUserMessage("msg_upstream_callback", "Earlier completion callback"),
+      makeAssistantMessage("msg_final_answer", [{ type: "text", text: "FINAL_MULTIHOP_ANSWER" }]),
+    ])
+    await sendTask(bridge)
+
+    await bridge.emitSessionIdle("ses_target")
+    await eventually(() => completionInputs(bridge).length, (count) => count > 0, "multi-hop callback")
+
+    expect(completionInputs(bridge)[0]?.text).toContain("FINAL_MULTIHOP_ANSWER")
+    expect(completionInputs(bridge)[0]?.text).not.toContain("Earlier completion callback")
   })
 
   it("does not emit extra callbacks from repeated or unrelated idle hooks", async () => {

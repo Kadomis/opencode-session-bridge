@@ -194,12 +194,16 @@ export function createFakeContext(
       _options?: Parameters<Plugin.Context["session"]["wait"]>[1],
     ) => {},
   )
+  let contextMessages: SessionMessageInfo[] = []
   const context = mock(
     async (
       _input: Parameters<Plugin.Context["session"]["context"]>[0],
       _options?: Parameters<Plugin.Context["session"]["context"]>[1],
-    ) => [] as SessionMessageInfo[],
+    ) => [...contextMessages] as SessionMessageInfo[],
   )
+  const setContextMessages = (messages: SessionMessageInfo[]) => {
+    contextMessages = [...messages]
+  }
   const remove = mock(
     async (
       input: Parameters<Plugin.Context["session"]["remove"]>[0],
@@ -368,6 +372,7 @@ export function createFakeContext(
     event: { subscribe: eventSubscribe, emit: emitEvent, history: eventHistory, subscribers: eventSubscribers },
     emitSessionIdle,
     sessionHooks,
+    setContextMessages,
     permission: { assert: assertPermission },
     tool: { transform },
     registration,
