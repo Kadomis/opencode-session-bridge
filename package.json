@@ -17,6 +17,7 @@
   ],
   "scripts": {
     "build": "bun build src/index.ts --target=node --format=esm --outdir=dist",
+    "pretest": "bun run build",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "test:coverage": "bun test --coverage",
