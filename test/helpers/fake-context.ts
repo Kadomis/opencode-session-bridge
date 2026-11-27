@@ -40,6 +40,21 @@ export interface FakeContextOptions {
   readonly sessionHook?: boolean
 }
 
+/** Minimal shape of an OpenCode event used by the handoff callback protocol. */
+export interface FakeBridgeEvent {
+  readonly type: string
+  readonly data?: Record<string, unknown>
+  readonly properties?: Record<string, unknown>
+  readonly [key: string]: unknown
+}
+
+interface EventSubscriber {
+  readonly types?: ReadonlyArray<string>
+  readonly signal?: AbortSignal
+  readonly queue: FakeBridgeEvent[]
+  wake?: () => void
+}
+
 export function makeSessionInfo(
   id: string,
   projectID: string,
@@ -207,6 +222,53 @@ export function createFakeContext(
     }),
   )
 
+  // Fake ctx.event.subscribe({ types }) as an async iterable. emitEvent() wakes
+  // active subscribers so tests can drive completion/idle/failure events.
+  const eventSubscribers = new Set<EventSubscriber>()
+  const eventHistory: FakeBridgeEvent[] = []
+  const eventSubscribe = mock(
+    (input?: { types?: ReadonlyArray<string>; signal?: AbortSignal }) => {
+      const subscriber: EventSubscriber = {
+        ...(input?.types === undefined ? {} : { types: input.types }),
+        ...(input?.signal === undefined ? {} : { signal: input.signal }),
+        queue: [],
+      }
+      eventSubscribers.add(subscriber)
+      input?.signal?.addEventListener("abort", () => {
+        subscriber.wake?.()
+        subscriber.wake = undefined
+      }, { once: true })
+      return {
+        async *[Symbol.asyncIterator]() {
+          try {
+            while (!subscriber.signal?.aborted) {
+              if (subscriber.queue.length > 0) {
+                const event = subscriber.queue.shift()
+                if (!event) break
+                eventHistory.push(event)
+                yield event
+                continue
+              }
+              await new Promise<void>((resolve) => {
+                subscriber.wake = resolve
+              })
+            }
+          } finally {
+            eventSubscribers.delete(subscriber)
+          }
+        },
+      }
+    },
+  )
+  const emitEvent = (event: FakeBridgeEvent) => {
+    for (const subscriber of eventSubscribers) {
+      if (subscriber.types && !subscriber.types.includes(event.type)) continue
+      subscriber.queue.push(event)
+      subscriber.wake?.()
+      subscriber.wake = undefined
+    }
+  }
+
   const tools = new Map<string, RegisteredTool>()
   if (fakeOptions.builtinSubagent !== undefined) {
     const description =
@@ -272,6 +334,7 @@ export function createFakeContext(
       },
     },
     session,
+    event: { subscribe: eventSubscribe },
     permission: { assert: assertPermission },
     tool: { transform },
   } as unknown as Plugin.Context
@@ -291,6 +354,7 @@ export function createFakeContext(
   return {
     ctx,
     session: { list, get, create, prompt, wait, context, remove, interrupt, hook: sessionHook },
+    event: { subscribe: eventSubscribe, emit: emitEvent, history: eventHistory, subscribers: eventSubscribers },
     permission: { assert: assertPermission },
     tool: { transform },
     registration,

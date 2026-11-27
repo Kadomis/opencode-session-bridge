@@ -5,6 +5,8 @@ import { fingerprintSendRequest, stableMessageID } from "./idempotency.js"
 import {
   createProvenance,
   createProvenanceMetadata,
+  PROVENANCE_METADATA_KEY,
+  PROVENANCE_VERSION,
   type Provenance,
 } from "./provenance.js"
 import { DEFAULT_RATE_LIMIT, RateLimiter, type RateLimitConfig } from "./rate-limit.js"
@@ -42,7 +44,24 @@ const SESSION_CREATE_DESCRIPTION =
   "Create a top-level session for bidirectional work. For a new session, separate session, top-level session, or another session to communicate with, you must use session_create, not the built-in subagent. Use the built-in subagent only for subagent, child agent, or delegate requests."
 
 const SESSION_SEND_DESCRIPTION =
-  "Send a prompt to another session or this session. For a top-level session or another session to communicate with, you must use session_create first, not the built-in subagent. Use the built-in subagent only for subagent, child agent, or delegate requests."
+  "Send a prompt to another session or this session. For a top-level session or another session to communicate with, you must use session_create first, not the built-in subagent. Use the built-in subagent only for subagent, child agent, or delegate requests. Set intent to 'task' with a conversationID for a non-blocking handoff: the call returns an admission receipt and the target sends a completion callback when it finishes."
+
+const HANDOFF_EVENT_TYPES = [
+  "session.idle",
+  "session.deleted",
+  "session.execution.failed",
+  "session.execution.interrupted",
+] as const
+
+type CompletionStatus = "completed" | "failed" | "cancelled" | "stale"
+
+interface PendingHandoff {
+  readonly originSessionID: string
+  readonly targetSessionID: string
+  readonly messageID: string
+  readonly conversationID: string
+  readonly createdAt: number
+}
 
 const SUBAGENT_WARNING =
   " WARNING: For a new session, separate session, top-level session, or another session to communicate with, use session_create. Do not use this tool for those requests. Use it only for explicit subagent, child agent, or delegate requests."
@@ -62,6 +81,7 @@ interface SendOutput {
   delivery: "steer" | "queue"
   duplicate: boolean
   provenance: Provenance
+  admitted?: boolean
   reply?: ReturnType<typeof extractReadableText>
 }
 
@@ -281,21 +301,150 @@ export function createSessionBridge(options: SessionBridgeOptions = {}): Plugin.
         idempotency.set(key, entry)
       }
 
+      // Pending task handoffs live only in server memory. The origin is taken
+      // from the tool context, never from caller-supplied fields.
+      const handoffs = new Map<string, PendingHandoff>()
+      const eventController = new AbortController()
+      let eventListener: Promise<void> | undefined
+
+      const registerHandoff = (record: PendingHandoff) => {
+        if (!handoffs.has(record.messageID)) handoffs.set(record.messageID, record)
+      }
+
+      const completionStatusFor = (type: string): CompletionStatus | undefined =>
+        type === "session.idle"
+          ? "completed"
+          : type === "session.deleted"
+            ? "stale"
+            : type === "session.execution.failed"
+              ? "failed"
+              : type === "session.execution.interrupted"
+                ? "cancelled"
+                : undefined
+
+      const sessionIDFromEvent = (event: unknown): string | undefined => {
+        const item = event as {
+          readonly data?: { readonly sessionID?: unknown }
+          readonly properties?: { readonly sessionID?: unknown }
+          readonly sessionID?: unknown
+        }
+        const candidate =
+          item?.data?.sessionID ?? item?.properties?.sessionID ?? item?.sessionID
+        return typeof candidate === "string" && candidate.length > 0 ? candidate : undefined
+      }
+
+      const dispatchTerminalEvent = async (event: unknown): Promise<void> => {
+        const item = event as { readonly type?: unknown }
+        const status =
+          typeof item?.type === "string" ? completionStatusFor(item.type) : undefined
+        if (status === undefined) return
+        const sessionID = sessionIDFromEvent(event)
+        if (sessionID === undefined) return
+
+        for (const [id, handoff] of handoffs) {
+          if (handoff.targetSessionID !== sessionID) continue
+          // Delete before awaiting so a second event cannot double-notify.
+          handoffs.delete(id)
+          const completionMessageID = newMessageID()
+          const metadata = {
+            session_bridge_completion: true,
+            [PROVENANCE_METADATA_KEY]: {
+              version: PROVENANCE_VERSION,
+              message_id: completionMessageID,
+              from_session: handoff.targetSessionID,
+              from_agent: "opencode-session-bridge",
+              to_session: handoff.originSessionID,
+              conversation_id: handoff.conversationID,
+              in_reply_to: handoff.messageID,
+              intent: "completion",
+              delivery: "steer",
+              completion_status: status,
+              sent_at: now(),
+            },
+          }
+          const text = [
+            `<session_bridge_completion status="${status}">`,
+            `Task handoff ${handoff.messageID} finished in session ${handoff.targetSessionID}.`,
+            `Conversation: ${handoff.conversationID}.`,
+            "This is an automatic completion callback from opencode-session-bridge.",
+            "The sender does not need to poll or read the target session.",
+            "</session_bridge_completion>",
+          ].join("\n")
+          try {
+            await ctx.session.prompt(
+              {
+                sessionID: handoff.originSessionID,
+                id: completionMessageID,
+                text,
+                metadata,
+                delivery: "steer",
+              },
+              { signal: eventController.signal },
+            )
+          } catch {
+            // The origin may be gone or interrupted. The handoff is already
+            // removed, so a failed callback cannot start a retry storm.
+          }
+        }
+      }
+
+      const subscribeTerminalEvents = () => {
+        if (typeof ctx.event?.subscribe !== "function") return
+        try {
+          const stream = ctx.event.subscribe({
+            types: [...HANDOFF_EVENT_TYPES],
+            signal: eventController.signal,
+          })
+          eventListener = (async () => {
+            try {
+              for await (const event of stream) {
+                await dispatchTerminalEvent(event)
+              }
+            } catch {
+              // The stream closes during plugin disposal.
+            }
+          })()
+        } catch {
+          // Event subscription is best effort; task sends still admit locally.
+        }
+      }
+
       async function send(raw: unknown, context: ToolContext) {
         throwIfAborted(context.signal)
         const input = parseSessionSendInput(raw, context.sessionID)
-        const delivery = input.waitForReply ? "steer" : input.delivery
-        const normalized = { ...input, delivery }
+        // A task handoff never waits for the target. The target reports back
+        // through the completion callback instead of being polled.
+        const isTask = input.intent === "task"
+        const waitForReply = isTask ? false : input.waitForReply
+        const delivery = waitForReply ? "steer" : input.delivery
+        const normalized = { ...input, delivery, waitForReply }
         const fingerprint = fingerprintSendRequest(normalized)
         const key = input.idempotencyKey
           ? `${context.sessionID}\u0000${context.agent}\u0000${input.idempotencyKey}`
+          : undefined
+
+        // Resolve the message ID before the permission request so the trusted
+        // handoff record can be recorded there. Caller-supplied origin fields
+        // are deliberately ignored.
+        const handoff: PendingHandoff | undefined = isTask
+          ? {
+              originSessionID: context.sessionID,
+              targetSessionID: input.targetSessionID,
+              messageID:
+                key && !customMessageID
+                  ? stableMessageID(context.sessionID, context.agent, input.idempotencyKey as string)
+                  : newMessageID(),
+              conversationID: input.conversationID as string,
+              createdAt: now(),
+            }
           : undefined
 
         await permit(ctx, context, "session_send", `session:${input.targetSessionID}`, {
           preview: redactSecrets(input.text).slice(0, 240),
           contentHash: fingerprint,
           conversationID: input.conversationID,
-          waitForReply: input.waitForReply,
+          waitForReply,
+          ...(handoff === undefined ? {} : { handoff }),
         })
         limiter.consume(context.sessionID)
         throwIfAborted(context.signal)
@@ -306,14 +455,14 @@ export function createSessionBridge(options: SessionBridgeOptions = {}): Plugin.
           throw new Error("Idempotency key was already used for a different request")
         }
         if (entry?.output) {
-          if (input.waitForReply) {
+          if (waitForReply) {
             await permit(ctx, context, "session_read", `session:${input.targetSessionID}`)
           }
           return { output: { ...entry.output, duplicate: true } }
         }
         if (entry?.inFlight) {
           const inFlight = entry.inFlight
-          if (input.waitForReply) {
+          if (waitForReply) {
             await permit(ctx, context, "session_read", `session:${input.targetSessionID}`)
           }
           if (entry.output) return { output: { ...entry.output, duplicate: true } }
@@ -324,9 +473,10 @@ export function createSessionBridge(options: SessionBridgeOptions = {}): Plugin.
         const duplicate = entry?.admission.admitted === true
         if (!entry) {
           const messageID =
-            key && !customMessageID
+            handoff?.messageID ??
+            (key && !customMessageID
               ? stableMessageID(context.sessionID, context.agent, input.idempotencyKey as string)
-              : newMessageID()
+              : newMessageID())
           const provenance = createProvenance(
             {
               messageID,
@@ -350,6 +500,7 @@ export function createSessionBridge(options: SessionBridgeOptions = {}): Plugin.
 
         const current = entry
         const resumingAdmission = current.admission.admitted
+        if (handoff) registerHandoff(handoff)
         const task = (async (): Promise<SendOutput> => {
           if (!current.admission.admitted) {
             if (!current.admission.promptAttempt) {
@@ -371,6 +522,9 @@ export function createSessionBridge(options: SessionBridgeOptions = {}): Plugin.
                   },
                   (error) => {
                     current.admission.promptAttempt = undefined
+                    // Do not leave a handoff behind for a message that was
+                    // never admitted to the target session.
+                    if (handoff) handoffs.delete(handoff.messageID)
                     throw error
                   },
                 )
@@ -379,7 +533,7 @@ export function createSessionBridge(options: SessionBridgeOptions = {}): Plugin.
           }
 
           let reply: ReturnType<typeof extractReadableText> | undefined
-          if (input.waitForReply) {
+          if (waitForReply) {
             await permit(ctx, context, "session_read", `session:${input.targetSessionID}`)
             try {
               await abortable(
@@ -416,6 +570,7 @@ export function createSessionBridge(options: SessionBridgeOptions = {}): Plugin.
             delivery: current.admission.delivery,
             duplicate,
             provenance: current.admission.provenance,
+            ...(isTask ? { admitted: true } : {}),
             ...(reply === undefined ? {} : { reply }),
           }
           current.output = output
@@ -806,10 +961,14 @@ export function createSessionBridge(options: SessionBridgeOptions = {}): Plugin.
         })
       })
 
+      subscribeTerminalEvents()
+
       let disposed = false
       return async () => {
         if (disposed) return
         disposed = true
+        eventController.abort()
+        handoffs.clear()
         idempotency.clear()
         limiter.clear()
         if (contextHookRegistration) await contextHookRegistration.dispose()

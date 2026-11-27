@@ -18,8 +18,9 @@ A global OpenCode V2 plugin for direct session communication.
 - Enforce per-caller rate limits on every bridge tool.
 - Bound idempotency and rate-limit state.
 - Cancel native operations with the tool signal.
+- Hand off tasks without polling and notify the origin when the target finishes.
 
-The plugin does not add turn limits. It does not forward or reply automatically.
+The plugin does not add turn limits. For task handoffs, the target notifies the origin automatically.
 
 ## Tools
 
@@ -76,6 +77,49 @@ The target model also receives a visible `<session_bridge_provenance>` block. Th
 4. Session B reuses `conversation_id`.
 5. Session B sets `inReplyToMessageID`.
 
+This manual flow remains available for conversation that needs a reply.
+
+## Task handoff completion protocol
+
+Use `intent: "task"` with a `conversationID` for delegated work. The call is non-blocking.
+
+1. Session A calls `session_send` with `intent: "task"` and a `conversationID`.
+2. The call returns immediately with an admission receipt that includes `admitted: true`.
+3. The origin is recorded from the tool context. Caller-supplied origin fields are ignored.
+4. The pending handoff is stored in server memory and attached to the trusted permission metadata as `handoff`.
+5. Session A does not call `session_wait` or `session_read`. It ends its turn.
+6. Session B runs the task. It does not need a special tool call to report completion.
+7. When Session B emits `session.idle`, `session.deleted`, `session.execution.failed`, or `session.execution.interrupted`, the plugin sends one completion prompt to Session A.
+
+The completion prompt targets the origin session and reuses the task conversation ID. Its metadata contains:
+
+- `session_bridge_completion: true`
+- `opencode_session_bridge.intent: "completion"`
+- `opencode_session_bridge.conversation_id`
+- `opencode_session_bridge.in_reply_to` — the task message ID
+- `opencode_session_bridge.from_session` — the target session
+- `opencode_session_bridge.to_session` — the origin session
+- `opencode_session_bridge.completion_status` — `completed`, `failed`, `cancelled`, or `stale`
+- `opencode_session_bridge.sent_at`
+
+Completion status mapping:
+
+| Event | Status |
+| --- | --- |
+| `session.idle` | `completed` |
+| `session.execution.failed` | `failed` |
+| `session.execution.interrupted` | `cancelled` |
+| `session.deleted` | `stale` |
+
+Loop prevention:
+
+- Tool callers cannot send `intent: "completion"`. Validation rejects it.
+- Completion prompts are sent through `ctx.session.prompt`, not through `session_send`. They never register a new handoff.
+- The handoff is removed from memory before the callback is sent, so repeat or unrelated events produce no extra callback.
+- A failed callback does not create a retry storm.
+
+Task sends ignore `waitForReply`. They never wait on the target or read target context.
+
 Use `idempotencyKey` when a model may retry the same send. The default plugin derives a stable message ID from the caller, agent, and key. This preserves duplicate suppression across plugin reloads.
 
 ## Permissions
@@ -95,9 +139,19 @@ bun test
 bun run test:coverage
 ```
 
-Current coverage is 100% for functions and 99.61% for lines.
+Current coverage is 100% for functions and 99.51% for lines.
 
 `bun audit` reports no known vulnerabilities.
+
+## Registration
+
+The plugin is registered in:
+
+`~/.config/opencode/opencode.jsonc`
+
+Source lives in:
+
+`~/.local/share/opencode-session-bridge`
 
 ## Disable
 
@@ -119,7 +173,7 @@ For an incident, deny these actions first:
 
 ## Risks
 
-- Message loops have no turn limit.
+- Message loops have no turn limit. Completion callbacks are exempt from creating new handoffs.
 - Reads can expose cross-project conversation text.
 - Peer messages can contain prompt injection.
 - Delete is recursive.

@@ -273,6 +273,12 @@ function parseSessionSendInput(value, callerSessionID) {
   const inReplyToMessageID = optionalText(input.inReplyToMessageID, "inReplyToMessageID", 256);
   const idempotencyKey = optionalText(input.idempotencyKey, "idempotencyKey", 128);
   const intent = input.intent === undefined ? "message" : text(input.intent, "intent", 64);
+  if (intent === "completion") {
+    throw new ValidationError("intent", "completion intent is reserved for bridge-generated callbacks");
+  }
+  if (intent === "task" && conversationID === undefined) {
+    throw new ValidationError("conversationID", "conversationID is required for task handoffs");
+  }
   const delivery = input.delivery === undefined ? "queue" : input.delivery;
   if (delivery !== "steer" && delivery !== "queue") {
     throw new ValidationError("delivery", "delivery must be steer or queue");
@@ -447,7 +453,13 @@ var TOOL_NAMES = [
 var definePlugin = (plugin) => plugin;
 var ROUTING_RULE = "Use session_create for a new session, separate session, top-level session, or another session to communicate with. Use the built-in subagent only for explicit subagent, child agent, or delegate requests. Keep top-level sessions; clean completed subagents with session_cleanup_subagents.";
 var SESSION_CREATE_DESCRIPTION = "Create a top-level session for bidirectional work. For a new session, separate session, top-level session, or another session to communicate with, you must use session_create, not the built-in subagent. Use the built-in subagent only for subagent, child agent, or delegate requests.";
-var SESSION_SEND_DESCRIPTION = "Send a prompt to another session or this session. For a top-level session or another session to communicate with, you must use session_create first, not the built-in subagent. Use the built-in subagent only for subagent, child agent, or delegate requests.";
+var SESSION_SEND_DESCRIPTION = "Send a prompt to another session or this session. For a top-level session or another session to communicate with, you must use session_create first, not the built-in subagent. Use the built-in subagent only for subagent, child agent, or delegate requests. Set intent to 'task' with a conversationID for a non-blocking handoff: the call returns an admission receipt and the target sends a completion callback when it finishes.";
+var HANDOFF_EVENT_TYPES = [
+  "session.idle",
+  "session.deleted",
+  "session.execution.failed",
+  "session.execution.interrupted"
+];
 var SUBAGENT_WARNING = " WARNING: For a new session, separate session, top-level session, or another session to communicate with, use session_create. Do not use this tool for those requests. Use it only for explicit subagent, child agent, or delegate requests.";
 var OUTPUT_SCHEMA = { type: "object", additionalProperties: true };
 var SESSION_ID_SCHEMA = {
@@ -604,18 +616,107 @@ function createSessionBridge(options = {}) {
         }
         idempotency.set(key, entry);
       };
+      const handoffs = new Map;
+      const eventController = new AbortController;
+      let eventListener;
+      const registerHandoff = (record) => {
+        if (!handoffs.has(record.messageID))
+          handoffs.set(record.messageID, record);
+      };
+      const completionStatusFor = (type) => type === "session.idle" ? "completed" : type === "session.deleted" ? "stale" : type === "session.execution.failed" ? "failed" : type === "session.execution.interrupted" ? "cancelled" : undefined;
+      const sessionIDFromEvent = (event) => {
+        const item = event;
+        const candidate = item?.data?.sessionID ?? item?.properties?.sessionID ?? item?.sessionID;
+        return typeof candidate === "string" && candidate.length > 0 ? candidate : undefined;
+      };
+      const dispatchTerminalEvent = async (event) => {
+        const item = event;
+        const status = typeof item?.type === "string" ? completionStatusFor(item.type) : undefined;
+        if (status === undefined)
+          return;
+        const sessionID = sessionIDFromEvent(event);
+        if (sessionID === undefined)
+          return;
+        for (const [id, handoff] of handoffs) {
+          if (handoff.targetSessionID !== sessionID)
+            continue;
+          handoffs.delete(id);
+          const completionMessageID = newMessageID();
+          const metadata = {
+            session_bridge_completion: true,
+            [PROVENANCE_METADATA_KEY]: {
+              version: PROVENANCE_VERSION,
+              message_id: completionMessageID,
+              from_session: handoff.targetSessionID,
+              from_agent: "opencode-session-bridge",
+              to_session: handoff.originSessionID,
+              conversation_id: handoff.conversationID,
+              in_reply_to: handoff.messageID,
+              intent: "completion",
+              delivery: "steer",
+              completion_status: status,
+              sent_at: now()
+            }
+          };
+          const text = [
+            `<session_bridge_completion status="${status}">`,
+            `Task handoff ${handoff.messageID} finished in session ${handoff.targetSessionID}.`,
+            `Conversation: ${handoff.conversationID}.`,
+            "This is an automatic completion callback from opencode-session-bridge.",
+            "The sender does not need to poll or read the target session.",
+            "</session_bridge_completion>"
+          ].join(`
+`);
+          try {
+            await ctx.session.prompt({
+              sessionID: handoff.originSessionID,
+              id: completionMessageID,
+              text,
+              metadata,
+              delivery: "steer"
+            }, { signal: eventController.signal });
+          } catch {}
+        }
+      };
+      const subscribeTerminalEvents = () => {
+        if (typeof ctx.event?.subscribe !== "function")
+          return;
+        try {
+          const stream = ctx.event.subscribe({
+            types: [...HANDOFF_EVENT_TYPES],
+            signal: eventController.signal
+          });
+          eventListener = (async () => {
+            try {
+              for await (const event of stream) {
+                await dispatchTerminalEvent(event);
+              }
+            } catch {}
+          })();
+        } catch {}
+      };
       async function send(raw, context) {
         throwIfAborted(context.signal);
         const input = parseSessionSendInput(raw, context.sessionID);
-        const delivery = input.waitForReply ? "steer" : input.delivery;
-        const normalized = { ...input, delivery };
+        const isTask = input.intent === "task";
+        const waitForReply = isTask ? false : input.waitForReply;
+        const delivery = waitForReply ? "steer" : input.delivery;
+        const normalized = { ...input, delivery, waitForReply };
         const fingerprint = fingerprintSendRequest(normalized);
         const key = input.idempotencyKey ? `${context.sessionID}\x00${context.agent}\x00${input.idempotencyKey}` : undefined;
+        const handoff = isTask ? {
+          originSessionID: context.sessionID,
+          targetSessionID: input.targetSessionID,
+          messageID: key && !customMessageID ? stableMessageID(context.sessionID, context.agent, input.idempotencyKey) : newMessageID(),
+          conversationID: input.conversationID,
+          createdAt: now()
+        } : undefined;
         await permit(ctx, context, "session_send", `session:${input.targetSessionID}`, {
           preview: redactSecrets(input.text).slice(0, 240),
           contentHash: fingerprint,
           conversationID: input.conversationID,
-          waitForReply: input.waitForReply
+          waitForReply,
+          ...handoff === undefined ? {} : { handoff }
         });
         limiter.consume(context.sessionID);
         throwIfAborted(context.signal);
@@ -625,14 +726,14 @@ function createSessionBridge(options = {}) {
           throw new Error("Idempotency key was already used for a different request");
         }
         if (entry?.output) {
-          if (input.waitForReply) {
+          if (waitForReply) {
             await permit(ctx, context, "session_read", `session:${input.targetSessionID}`);
           }
           return { output: { ...entry.output, duplicate: true } };
         }
         if (entry?.inFlight) {
           const inFlight = entry.inFlight;
-          if (input.waitForReply) {
+          if (waitForReply) {
             await permit(ctx, context, "session_read", `session:${input.targetSessionID}`);
           }
           if (entry.output)
@@ -642,7 +743,7 @@ function createSessionBridge(options = {}) {
         }
         const duplicate = entry?.admission.admitted === true;
         if (!entry) {
-          const messageID = key && !customMessageID ? stableMessageID(context.sessionID, context.agent, input.idempotencyKey) : newMessageID();
+          const messageID = handoff?.messageID ?? (key && !customMessageID ? stableMessageID(context.sessionID, context.agent, input.idempotencyKey) : newMessageID());
           const provenance = createProvenance({
             messageID,
             fromSessionID: context.sessionID,
@@ -663,6 +764,8 @@ function createSessionBridge(options = {}) {
         }
         const current = entry;
         const resumingAdmission = current.admission.admitted;
+        if (handoff)
+          registerHandoff(handoff);
         const task = (async () => {
           if (!current.admission.admitted) {
             if (!current.admission.promptAttempt) {
@@ -677,13 +780,15 @@ function createSessionBridge(options = {}) {
                 current.admission.promptAttempt = undefined;
               }, (error) => {
                 current.admission.promptAttempt = undefined;
+                if (handoff)
+                  handoffs.delete(handoff.messageID);
                 throw error;
               });
             }
             await abortable(context.signal, current.admission.promptAttempt);
           }
           let reply;
-          if (input.waitForReply) {
+          if (waitForReply) {
             await permit(ctx, context, "session_read", `session:${input.targetSessionID}`);
             try {
               await abortable(context.signal, ctx.session.wait({ sessionID: input.targetSessionID }, { signal: context.signal }));
@@ -707,6 +812,7 @@ function createSessionBridge(options = {}) {
             delivery: current.admission.delivery,
             duplicate,
             provenance: current.admission.provenance,
+            ...isTask ? { admitted: true } : {},
             ...reply === undefined ? {} : { reply }
           };
           current.output = output;
@@ -1024,11 +1130,14 @@ function createSessionBridge(options = {}) {
           }
         });
       });
+      subscribeTerminalEvents();
       let disposed = false;
       return async () => {
         if (disposed)
           return;
         disposed = true;
+        eventController.abort();
+        handoffs.clear();
         idempotency.clear();
         limiter.clear();
         if (contextHookRegistration)
