@@ -11,12 +11,16 @@
   "files": [
     "dist",
     "src",
+    "rust/Cargo.toml",
+    "rust/src",
     "README.md",
     "LICENSE",
     "CHANGELOG.md"
   ],
   "scripts": {
     "build": "bun build src/index.ts --target=node --format=esm --outdir=dist",
+    "build:core": "cargo build --release --manifest-path rust/Cargo.toml",
+    "test:core": "cargo test --manifest-path rust/Cargo.toml",
     "pretest": "bun run build",
     "typecheck": "tsc --noEmit",
     "test": "bun test",

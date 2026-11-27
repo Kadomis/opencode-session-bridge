@@ -141,6 +141,36 @@ The plugin still calls `ctx.permission.assert` for every action. This preserves 
 
 Delete requires `confirmSessionID` to equal `sessionID`. Deletion is recursive.
 
+## Rust core
+
+The handoff state and completion payload logic live in a Rust core at `rust/`.
+The TypeScript shim at `src/core-client.ts` spawns the compiled binary and
+exchanges newline-delimited JSON over stdin and stdout.
+
+The core owns:
+
+- pending handoff registration, resolution, and removal
+- completion status mapping
+- completion text and metadata construction
+- secret redaction inside completion results
+- rate-limit validation and input validation helpers
+
+The TypeScript layer owns OpenCode I/O: permissions, prompts, session reads,
+hooks, and event subscription.
+
+Build the core:
+
+```bash
+bun run build:core
+bun run test:core
+```
+
+The shim looks for the binary at `rust/target/release/session-bridge-core`,
+then `rust/target/debug/session-bridge-core`. Set `OPENCODE_BRIDGE_CORE` to an
+explicit path to override both. If no binary exists, the plugin uses its
+TypeScript fallback. The published npm package includes the Rust source, not a
+prebuilt binary.
+
 ## Development
 
 ```bash
@@ -150,7 +180,7 @@ bun test
 bun run test:coverage
 ```
 
-Current coverage is 100% for functions and 99.50% for lines.
+Current coverage is 98.27% for functions and 97.09% for lines. The uncovered paths are the TypeScript fallbacks used when the Rust binary is absent.
 
 `bun audit` reports no known vulnerabilities.
 
