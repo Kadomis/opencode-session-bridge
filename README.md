@@ -121,6 +121,8 @@ Loop prevention:
 
 Task sends ignore `waitForReply`. They never wait on the target or read target context.
 
+Runtime limitation: some runtimes do not forward session lifecycle events to plugins. In that case only successful completion is reported through the `experimental.idle` hook. Failed, interrupted, and deleted targets produce no callback unless the runtime forwards the event fallback.
+
 Use `idempotencyKey` when a model may retry the same send. The default plugin derives a stable message ID from the caller, agent, and key. This preserves duplicate suppression across plugin reloads.
 
 ## Permissions
