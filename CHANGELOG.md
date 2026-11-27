@@ -1,12 +1,15 @@
 # Changelog
 
-## 1.1.0 - 2026-11-27
+## 1.2.0 - 2026-11-27
 
 - Add a non-blocking task handoff protocol with `intent: "task"` and a required `conversationID`.
 - Return an immediate admission receipt and record a server-controlled pending handoff.
 - Send one automatic completion callback to the origin on target idle, failure, interruption, or deletion.
 - Prevent callback loops by reserving `intent: "completion"` and never registering handoffs from completion prompts.
 - Add integration tests for immediate admission, callback routing, no polling, loop prevention, and stale handling.
+
+## 1.1.0 - 2026-11-26
+
 - Add `session_create` for true top-level sessions.
 - Add `session_cleanup_subagents` for completed, cancelled, stale, and idle subagents.
 - Add explicit routing guidance to tool descriptions, context, and the built-in subagent description.
