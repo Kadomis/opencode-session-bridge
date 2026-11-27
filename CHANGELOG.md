@@ -7,6 +7,7 @@
 - Send one automatic completion callback to the origin on target idle, failure, interruption, or deletion.
 - Prevent callback loops by reserving `intent: "completion"` and never registering handoffs from completion prompts.
 - Add integration tests for immediate admission, callback routing, no polling, loop prevention, and stale handling.
+- Add a build-artifact guard test so a stale `dist/index.js` cannot silently disable the protocol.
 
 ## 1.1.0 - 2026-11-26
 
