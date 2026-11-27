@@ -333,14 +333,7 @@ export function createSessionBridge(options: SessionBridgeOptions = {}): Plugin.
         return typeof candidate === "string" && candidate.length > 0 ? candidate : undefined
       }
 
-      const dispatchTerminalEvent = async (event: unknown): Promise<void> => {
-        const item = event as { readonly type?: unknown }
-        const status =
-          typeof item?.type === "string" ? completionStatusFor(item.type) : undefined
-        if (status === undefined) return
-        const sessionID = sessionIDFromEvent(event)
-        if (sessionID === undefined) return
-
+      const dispatchCompletion = async (sessionID: string, status: CompletionStatus): Promise<void> => {
         for (const [id, handoff] of handoffs) {
           if (handoff.targetSessionID !== sessionID) continue
           // Delete before awaiting so a second event cannot double-notify.
@@ -388,6 +381,16 @@ export function createSessionBridge(options: SessionBridgeOptions = {}): Plugin.
         }
       }
 
+      const dispatchTerminalEvent = async (event: unknown): Promise<void> => {
+        const item = event as { readonly type?: unknown }
+        const status =
+          typeof item?.type === "string" ? completionStatusFor(item.type) : undefined
+        if (status === undefined) return
+        const sessionID = sessionIDFromEvent(event)
+        if (sessionID === undefined) return
+        await dispatchCompletion(sessionID, status)
+      }
+
       const subscribeTerminalEvents = () => {
         if (typeof ctx.event?.subscribe !== "function") return
         try {
@@ -407,6 +410,16 @@ export function createSessionBridge(options: SessionBridgeOptions = {}): Plugin.
         } catch {
           // Event subscription is best effort; task sends still admit locally.
         }
+      }
+
+      // The runtime does not forward session lifecycle events to plugins, so
+      // the idle hook is the reliable completion signal. Event handling is
+      // kept as a fallback for runtimes that do forward those events.
+      let idleHookRegistration: { dispose(): Promise<void> | void } | undefined
+      if (typeof ctx.session.hook === "function") {
+        idleHookRegistration = await ctx.session.hook("experimental.idle", (event) => {
+          void dispatchCompletion(event.sessionID, "completed")
+        })
       }
 
       async function send(raw: unknown, context: ToolContext) {
@@ -972,6 +985,7 @@ export function createSessionBridge(options: SessionBridgeOptions = {}): Plugin.
         idempotency.clear()
         limiter.clear()
         if (contextHookRegistration) await contextHookRegistration.dispose()
+        if (idleHookRegistration) await idleHookRegistration.dispose()
         await registration.dispose()
       }
     },

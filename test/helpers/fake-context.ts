@@ -216,11 +216,22 @@ export function createFakeContext(
     ) => ({ interrupted: true }),
   )
   const assertPermission = mock(async (_input: PermissionAssertInput) => {})
+  const sessionHooks = new Map<string, SessionHookCallback>()
   const sessionHook = mock(
-    async (_name: string, _callback: SessionHookCallback) => ({
-      dispose: mock(async () => {}),
-    }),
+    async (name: string, callback: SessionHookCallback) => {
+      sessionHooks.set(name, callback)
+      return {
+        dispose: mock(async () => {
+          sessionHooks.delete(name)
+        }),
+      }
+    },
   )
+  const emitSessionIdle = async (sessionID: string) => {
+    const callback = sessionHooks.get("experimental.idle")
+    if (!callback) throw new Error("experimental.idle hook is not registered")
+    await callback({ sessionID } as unknown as Parameters<SessionHookCallback>[0])
+  }
 
   // Fake ctx.event.subscribe({ types }) as an async iterable. emitEvent() wakes
   // active subscribers so tests can drive completion/idle/failure events.
@@ -355,6 +366,8 @@ export function createFakeContext(
     ctx,
     session: { list, get, create, prompt, wait, context, remove, interrupt, hook: sessionHook },
     event: { subscribe: eventSubscribe, emit: emitEvent, history: eventHistory, subscribers: eventSubscribers },
+    emitSessionIdle,
+    sessionHooks,
     permission: { assert: assertPermission },
     tool: { transform },
     registration,

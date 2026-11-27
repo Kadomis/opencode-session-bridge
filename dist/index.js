@@ -629,14 +629,7 @@ function createSessionBridge(options = {}) {
         const candidate = item?.data?.sessionID ?? item?.properties?.sessionID ?? item?.sessionID;
         return typeof candidate === "string" && candidate.length > 0 ? candidate : undefined;
       };
-      const dispatchTerminalEvent = async (event) => {
-        const item = event;
-        const status = typeof item?.type === "string" ? completionStatusFor(item.type) : undefined;
-        if (status === undefined)
-          return;
-        const sessionID = sessionIDFromEvent(event);
-        if (sessionID === undefined)
-          return;
+      const dispatchCompletion = async (sessionID, status) => {
         for (const [id, handoff] of handoffs) {
           if (handoff.targetSessionID !== sessionID)
             continue;
@@ -678,6 +671,16 @@ function createSessionBridge(options = {}) {
           } catch {}
         }
       };
+      const dispatchTerminalEvent = async (event) => {
+        const item = event;
+        const status = typeof item?.type === "string" ? completionStatusFor(item.type) : undefined;
+        if (status === undefined)
+          return;
+        const sessionID = sessionIDFromEvent(event);
+        if (sessionID === undefined)
+          return;
+        await dispatchCompletion(sessionID, status);
+      };
       const subscribeTerminalEvents = () => {
         if (typeof ctx.event?.subscribe !== "function")
           return;
@@ -695,6 +698,12 @@ function createSessionBridge(options = {}) {
           })();
         } catch {}
       };
+      let idleHookRegistration;
+      if (typeof ctx.session.hook === "function") {
+        idleHookRegistration = await ctx.session.hook("experimental.idle", (event) => {
+          dispatchCompletion(event.sessionID, "completed");
+        });
+      }
       async function send(raw, context) {
         throwIfAborted(context.signal);
         const input = parseSessionSendInput(raw, context.sessionID);
@@ -1142,6 +1151,8 @@ function createSessionBridge(options = {}) {
         limiter.clear();
         if (contextHookRegistration)
           await contextHookRegistration.dispose();
+        if (idleHookRegistration)
+          await idleHookRegistration.dispose();
         await registration.dispose();
       };
     }

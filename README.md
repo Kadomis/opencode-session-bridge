@@ -89,7 +89,7 @@ Use `intent: "task"` with a `conversationID` for delegated work. The call is non
 4. The pending handoff is stored in server memory and attached to the trusted permission metadata as `handoff`.
 5. Session A does not call `session_wait` or `session_read`. It ends its turn.
 6. Session B runs the task. It does not need a special tool call to report completion.
-7. When Session B emits `session.idle`, `session.deleted`, `session.execution.failed`, or `session.execution.interrupted`, the plugin sends one completion prompt to Session A.
+7. When Session B finishes, the plugin sends one completion prompt to Session A. The primary signal is the `experimental.idle` session hook. `session.idle`, `session.deleted`, `session.execution.failed`, and `session.execution.interrupted` events are a fallback for runtimes that forward them.
 
 The completion prompt targets the origin session and reuses the task conversation ID. Its metadata contains:
 
@@ -104,9 +104,10 @@ The completion prompt targets the origin session and reuses the task conversatio
 
 Completion status mapping:
 
-| Event | Status |
+| Signal | Status |
 | --- | --- |
-| `session.idle` | `completed` |
+| `experimental.idle` hook | `completed` |
+| `session.idle` event | `completed` |
 | `session.execution.failed` | `failed` |
 | `session.execution.interrupted` | `cancelled` |
 | `session.deleted` | `stale` |

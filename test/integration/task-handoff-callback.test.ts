@@ -312,6 +312,47 @@ describe("task handoff completion callbacks", () => {
     expect(completionInputs(bridge)).toHaveLength(2)
   })
 
+  it("sends a completion callback when the target idle hook fires", async () => {
+    const bridge = await setupBridge(bridgeOptions(), { sessionHook: true })
+    await sendTask(bridge)
+
+    await bridge.emitSessionIdle("ses_target")
+    await eventually(() => completionInputs(bridge).length, (count) => count > 0, "idle hook callback")
+
+    expect(completionInputs(bridge)[0]?.sessionID).toBe("ses_caller")
+    expect(completionInputs(bridge)[0]?.metadata).toEqual(
+      expect.objectContaining({
+        session_bridge_completion: true,
+        opencode_session_bridge: expect.objectContaining({
+          intent: "completion",
+          conversation_id: "conv_task",
+          in_reply_to: "msg_bridge_1",
+          from_session: "ses_target",
+          to_session: "ses_caller",
+          completion_status: "completed",
+        }),
+      }),
+    )
+    expect(bridge.session.wait).not.toHaveBeenCalled()
+    expect(bridge.session.context).not.toHaveBeenCalled()
+    expect(bridge.sessionHook).toHaveBeenCalledWith("experimental.idle", expect.any(Function))
+  })
+
+  it("does not emit extra callbacks from repeated or unrelated idle hooks", async () => {
+    const bridge = await setupBridge(bridgeOptions(), { sessionHook: true })
+    await sendTask(bridge)
+
+    await bridge.emitSessionIdle("ses_target")
+    await eventually(() => completionInputs(bridge).length, (count) => count === 1, "first idle callback")
+    await bridge.emitSessionIdle("ses_target")
+    await bridge.emitSessionIdle("ses_unrelated")
+    await Bun.sleep(10)
+
+    expect(completionInputs(bridge)).toHaveLength(1)
+    expect(promptInputs(bridge)).toHaveLength(2)
+    expect(bridge.permission.assert).toHaveBeenCalledTimes(1)
+  })
+
   it("validates task handoff fields and rejects completion-intent sends", async () => {
     const invalid = await setupBridge(bridgeOptions())
     await expect(
