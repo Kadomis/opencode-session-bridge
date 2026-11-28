@@ -407,6 +407,90 @@ describe("task handoff completion callbacks", () => {
     expect(bridge.permission.assert).toHaveBeenCalledTimes(1)
   })
 
+  it("registers a handoff for a custom intent when conversationID is present", async () => {
+    const bridge = await setupBridge(bridgeOptions(), { sessionHook: true })
+
+    const output = await outputOf<TaskOutput>(
+      await bridge.execute(
+        "session_send",
+        {
+          targetSessionID: "ses_target",
+          text: "Restart the containers",
+          conversationID: "conv_custom_intent",
+          intent: "restart-kiri-containers",
+          delivery: "queue",
+        },
+        makeToolContext({ sessionID: "ses_caller", messageID: "msg_tool_call" }),
+      ),
+    )
+
+    expect(output).toEqual(expect.objectContaining({ admitted: true, conversationID: "conv_custom_intent" }))
+    expect(bridge.session.wait).not.toHaveBeenCalled()
+    expect(bridge.session.context).not.toHaveBeenCalled()
+    expect(pendingHandoffMetadata(bridge)).toEqual(
+      expect.objectContaining({
+        originSessionID: "ses_caller",
+        targetSessionID: "ses_target",
+        messageID: "msg_bridge_1",
+        conversationID: "conv_custom_intent",
+      }),
+    )
+
+    await bridge.emitSessionIdle("ses_target")
+    await eventually(() => completionInputs(bridge).length, (count) => count > 0, "custom-intent callback")
+    expect(completionInputs(bridge)[0]?.metadata?.opencode_session_bridge).toEqual(
+      expect.objectContaining({
+        intent: "completion",
+        conversation_id: "conv_custom_intent",
+        in_reply_to: "msg_bridge_1",
+        completion_status: "completed",
+      }),
+    )
+  })
+
+  it("treats a plain message with conversationID as a handoff too", async () => {
+    const bridge = await setupBridge(bridgeOptions(), { sessionHook: true })
+
+    await bridge.execute(
+      "session_send",
+      {
+        targetSessionID: "ses_target",
+        text: "Do the work and report back",
+        conversationID: "conv_implicit",
+        delivery: "queue",
+      },
+      makeToolContext({ sessionID: "ses_caller" }),
+    )
+
+    expect(pendingHandoffMetadata(bridge)).toEqual(
+      expect.objectContaining({ conversationID: "conv_implicit", messageID: "msg_bridge_1" }),
+    )
+    await bridge.emitSessionIdle("ses_target")
+    await eventually(() => completionInputs(bridge).length, (count) => count > 0, "implicit callback")
+    expect(completionInputs(bridge)[0]?.metadata?.opencode_session_bridge).toEqual(
+      expect.objectContaining({ conversation_id: "conv_implicit" }),
+    )
+  })
+
+  it("does not register a handoff without a conversationID", async () => {
+    const bridge = await setupBridge(bridgeOptions(), { sessionHook: true })
+
+    const output = await outputOf<TaskOutput>(
+      await bridge.execute(
+        "session_send",
+        { targetSessionID: "ses_target", text: "Just a message", delivery: "queue" },
+        makeToolContext({ sessionID: "ses_caller" }),
+      ),
+    )
+
+    expect(output).toEqual(expect.objectContaining({ messageID: "msg_bridge_1" }))
+    expect(output.admitted).toBeUndefined()
+    expect(bridge.permission.assert.mock.calls[0]?.[0].metadata?.handoff).toBeUndefined()
+    await bridge.emitSessionIdle("ses_target")
+    await Bun.sleep(10)
+    expect(completionInputs(bridge)).toHaveLength(0)
+  })
+
   it("validates task handoff fields and rejects completion-intent sends", async () => {
     const invalid = await setupBridge(bridgeOptions())
     await expect(

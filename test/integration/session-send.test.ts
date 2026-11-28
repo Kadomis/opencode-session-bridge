@@ -12,6 +12,7 @@ interface SendOutput {
   conversationID: string
   delivery: "steer" | "queue"
   duplicate: boolean
+  admitted?: boolean
   provenance: Record<string, unknown>
 }
 
@@ -86,12 +87,14 @@ describe("session_send", () => {
       },
     })
     expect(promptInput?.text.endsWith("Review this change")).toBe(true)
+    // A conversationID makes this a handoff regardless of the custom intent.
     expect(output).toEqual({
       messageID: "msg_bridge_1",
       sessionID: "ses_target",
       conversationID: "conv_review",
       delivery: "queue",
       duplicate: false,
+      admitted: true,
       provenance,
     })
     expectPermissionAssert(bridge, "session_send", "session:ses_target")

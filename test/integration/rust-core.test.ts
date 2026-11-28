@@ -29,6 +29,15 @@ describe.skipIf(!isCoreAvailable())("Rust core protocol", () => {
     )
   })
 
+  it("fails closed when a task handoff has no conversationID", async () => {
+    await expect(
+      coreCall("validate_send", {
+        callerSessionID: "ses_caller",
+        input: { targetSessionID: "ses_target", text: "work", intent: "task" },
+      }),
+    ).rejects.toThrow(/conversationID/i)
+  })
+
   it("rejects a completion-intent send in Rust", async () => {
     await expect(
       coreCall("validate_send", {

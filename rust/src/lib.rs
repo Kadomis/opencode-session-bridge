@@ -298,34 +298,57 @@ pub struct PendingHandoff {
     pub created_at: u64,
 }
 
+/// Handoffs are scoped by the bridge instance that created them. The core is
+/// a single process shared by all plugin instances, so without this namespace
+/// one bridge could resolve another bridge's pending handoff.
 #[derive(Default)]
 pub struct HandoffRegistry {
-    pending: HashMap<String, PendingHandoff>,
+    pending: HashMap<String, HashMap<String, PendingHandoff>>,
+}
+
+fn namespace(bridge_id: &str) -> String {
+    if bridge_id.is_empty() {
+        "default".to_string()
+    } else {
+        bridge_id.to_string()
+    }
 }
 
 impl HandoffRegistry {
-    pub fn register(&mut self, handoff: PendingHandoff) {
-        self.pending.entry(handoff.message_id.clone()).or_insert(handoff);
+    pub fn register(&mut self, bridge_id: &str, handoff: PendingHandoff) {
+        self.pending
+            .entry(namespace(bridge_id))
+            .or_default()
+            .entry(handoff.message_id.clone())
+            .or_insert(handoff);
     }
 
-    pub fn resolve(&mut self, session_id: &str) -> Vec<PendingHandoff> {
-        let ids: Vec<String> = self
-            .pending
+    pub fn resolve(&mut self, bridge_id: &str, session_id: &str) -> Vec<PendingHandoff> {
+        let Some(scope) = self.pending.get_mut(&namespace(bridge_id)) else {
+            return Vec::new();
+        };
+        let ids: Vec<String> = scope
             .iter()
             .filter(|(_, h)| h.target_session_id == session_id)
             .map(|(id, _)| id.clone())
             .collect();
         ids.into_iter()
-            .filter_map(|id| self.pending.remove(&id))
+            .filter_map(|id| scope.remove(&id))
             .collect()
     }
 
-    pub fn remove(&mut self, message_id: &str) {
-        self.pending.remove(message_id);
+    pub fn remove(&mut self, bridge_id: &str, message_id: &str) {
+        if let Some(scope) = self.pending.get_mut(&namespace(bridge_id)) {
+            scope.remove(message_id);
+        }
+    }
+
+    pub fn clear(&mut self, bridge_id: &str) {
+        self.pending.remove(&namespace(bridge_id));
     }
 
     pub fn len(&self) -> usize {
-        self.pending.len()
+        self.pending.values().map(HashMap::len).sum()
     }
 }
 
@@ -432,20 +455,34 @@ pub fn handle_request(line: &str, state: &mut CoreState) -> String {
             let window = payload.get("windowMs").and_then(Value::as_u64).unwrap_or(60_000);
             Ok(json!({ "allowed": state.rate_limiter.consume(key, now, max, window) }))
         }
-        "handoff_register" => serde_json::from_value(payload)
-            .map_err(|e| e.to_string())
-            .map(|handoff: PendingHandoff| {
-                state.handoffs.register(handoff);
-                json!({ "pending": state.handoffs.len() })
-            }),
+        "handoff_register" => {
+            let bridge_id = payload
+                .get("bridgeID")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            serde_json::from_value(payload)
+                .map_err(|e| e.to_string())
+                .map(|handoff: PendingHandoff| {
+                    state.handoffs.register(&bridge_id, handoff);
+                    json!({ "pending": state.handoffs.len() })
+                })
+        }
         "handoff_resolve" => {
+            let bridge_id = payload.get("bridgeID").and_then(Value::as_str).unwrap_or("");
             let session_id = payload.get("sessionID").and_then(Value::as_str).unwrap_or("");
-            Ok(json!(state.handoffs.resolve(session_id)))
+            Ok(json!(state.handoffs.resolve(bridge_id, session_id)))
         }
         "handoff_remove" => {
+            let bridge_id = payload.get("bridgeID").and_then(Value::as_str).unwrap_or("");
             let message_id = payload.get("messageID").and_then(Value::as_str).unwrap_or("");
-            state.handoffs.remove(message_id);
+            state.handoffs.remove(bridge_id, message_id);
             Ok(json!({ "removed": true }))
+        }
+        "handoff_clear" => {
+            let bridge_id = payload.get("bridgeID").and_then(Value::as_str).unwrap_or("");
+            state.handoffs.clear(bridge_id);
+            Ok(json!({ "cleared": true }))
         }
         "build_completion" => {
             match serde_json::from_value::<PendingHandoff>(
@@ -543,10 +580,18 @@ mod tests {
     #[test]
     fn handoff_registry_resolves_once() {
         let mut registry = HandoffRegistry::default();
-        registry.register(handoff());
-        assert_eq!(registry.resolve("ses_target").len(), 1);
-        assert!(registry.resolve("ses_target").is_empty());
-        assert!(registry.resolve("ses_other").is_empty());
+        registry.register("bridge_a", handoff());
+        assert_eq!(registry.resolve("bridge_a", "ses_target").len(), 1);
+        assert!(registry.resolve("bridge_a", "ses_target").is_empty());
+        assert!(registry.resolve("bridge_a", "ses_other").is_empty());
+    }
+
+    #[test]
+    fn handoff_registry_isolates_bridge_instances() {
+        let mut registry = HandoffRegistry::default();
+        registry.register("bridge_a", handoff());
+        assert!(registry.resolve("bridge_b", "ses_target").is_empty());
+        assert_eq!(registry.resolve("bridge_a", "ses_target").len(), 1);
     }
 
     #[test]

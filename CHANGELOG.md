@@ -8,6 +8,8 @@
 - Carry the target's redacted final assistant output in the callback so the origin can continue without polling.
 - Move pending handoff state, status mapping, completion payload construction, and result redaction into a Rust core.
 - Add a TypeScript shim that talks to the Rust core over newline-delimited JSON and falls back to TypeScript when no binary is present.
+- Treat any `session_send` with a `conversationID` as a handoff, regardless of its custom intent. An explicit `intent: "task"` without a `conversationID` fails closed.
+- Scope pending handoffs in the Rust core by bridge instance so one plugin cannot resolve another's handoff.
 - Prevent callback loops by reserving `intent: "completion"` and never registering handoffs from completion prompts.
 - Add integration tests for immediate admission, callback routing, no polling, loop prevention, and stale handling.
 - Add a build-artifact guard test that fails when `dist/index.js` is older than `src/index.ts` or missing the callback contract.

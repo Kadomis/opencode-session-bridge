@@ -83,6 +83,10 @@ function isCoreAvailable() {
     return false;
   return binaryPath() !== undefined;
 }
+var bridgeID = "";
+function setBridgeCoreID(id) {
+  bridgeID = id;
+}
 async function coreCall(command, payload = {}) {
   const core = ensureChild();
   if (!core)
@@ -94,7 +98,8 @@ async function coreCall(command, payload = {}) {
       reject: rejectPromise
     });
     try {
-      core.write(`${JSON.stringify({ id, command, payload })}
+      const scoped = typeof payload === "object" && payload !== null ? { ...payload, bridgeID } : payload;
+      core.write(`${JSON.stringify({ id, command, payload: scoped })}
 `);
     } catch (error) {
       pending.delete(id);
@@ -677,6 +682,7 @@ function createSessionBridge(options = {}) {
   return definePlugin({
     id: "opencode-session-bridge",
     setup: async (ctx) => {
+      setBridgeCoreID(crypto.randomUUID());
       const now = options.now ?? Date.now;
       const customMessageID = options.newMessageID !== undefined;
       const newMessageID = options.newMessageID ?? (() => `msg_bridge_${crypto.randomUUID().replaceAll("-", "")}`);
@@ -869,7 +875,7 @@ function createSessionBridge(options = {}) {
       async function send(raw, context) {
         throwIfAborted(context.signal);
         const input = parseSessionSendInput(raw, context.sessionID);
-        const isTask = input.intent === "task";
+        const isTask = input.conversationID !== undefined;
         const waitForReply = isTask ? false : input.waitForReply;
         const delivery = waitForReply ? "steer" : input.delivery;
         const normalized = { ...input, delivery, waitForReply };
@@ -1309,6 +1315,8 @@ function createSessionBridge(options = {}) {
         disposed = true;
         eventController.abort();
         handoffs.clear();
+        if (isCoreAvailable())
+          coreCall("handoff_clear", {}).catch(() => {});
         idempotency.clear();
         limiter.clear();
         if (contextHookRegistration)

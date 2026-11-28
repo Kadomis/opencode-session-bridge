@@ -81,9 +81,9 @@ This manual flow remains available for conversation that needs a reply.
 
 ## Task handoff completion protocol
 
-Use `intent: "task"` with a `conversationID` for delegated work. The call is non-blocking.
+A `conversationID` is the handoff contract. Any `intent` that carries a `conversationID` is a task handoff. The call is non-blocking. Use `intent: "task"` for clarity, but it is not required.
 
-1. Session A calls `session_send` with `intent: "task"` and a `conversationID`.
+1. Session A calls `session_send` with a `conversationID` and any non-reserved intent.
 2. The call returns immediately with an admission receipt that includes `admitted: true`.
 3. The origin is recorded from the tool context. Caller-supplied origin fields are ignored.
 4. The pending handoff is stored in server memory and attached to the trusted permission metadata as `handoff`.
@@ -119,6 +119,12 @@ Completion status mapping:
 | `session.execution.failed` | `failed` |
 | `session.execution.interrupted` | `cancelled` |
 | `session.deleted` | `stale` |
+
+Fail-closed rules:
+
+- An explicit `intent: "task"` without a `conversationID` is rejected. There is no correlation key, so no callback could be sent.
+- A send without a `conversationID` is an ordinary message and registers no handoff.
+- A handoff with any custom intent and a `conversationID` still registers and notifies.
 
 Loop prevention:
 

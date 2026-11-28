@@ -83,6 +83,16 @@ export function isCoreAvailable(): boolean {
   return binaryPath() !== undefined
 }
 
+let bridgeID = ""
+
+export function setBridgeCoreID(id: string): void {
+  bridgeID = id
+}
+
+export function getBridgeCoreID(): string {
+  return bridgeID
+}
+
 export async function coreCall<T>(command: string, payload: unknown = {}): Promise<T> {
   const core = ensureChild()
   if (!core) throw new Error("Rust core is unavailable")
@@ -93,7 +103,10 @@ export async function coreCall<T>(command: string, payload: unknown = {}): Promi
       reject: rejectPromise,
     })
     try {
-      core.write(`${JSON.stringify({ id, command, payload })}\n`)
+      const scoped = typeof payload === "object" && payload !== null
+        ? { ...payload, bridgeID }
+        : payload
+      core.write(`${JSON.stringify({ id, command, payload: scoped })}\n`)
     } catch (error) {
       pending.delete(id)
       rejectPromise(error instanceof Error ? error : new Error(String(error)))

@@ -83,8 +83,9 @@ export function parseSessionSendInput(value: unknown, callerSessionID: string): 
   if (intent === "completion") {
     throw new ValidationError("intent", "completion intent is reserved for bridge-generated callbacks")
   }
-  // A task handoff carries the conversation ID the target must report back to.
-  // Without it the origin cannot receive a correlated completion callback.
+  // A task handoff is signalled by any intent plus a conversationID. Without
+  // the conversationID there is no correlation key for a callback, so an
+  // explicit intent "task" fails closed instead of sending without a callback.
   if (intent === "task" && conversationID === undefined) {
     throw new ValidationError("conversationID", "conversationID is required for task handoffs")
   }

@@ -1,7 +1,7 @@
 import { resolve } from "node:path"
 import type { Plugin } from "@opencode/plugin"
 import type { ToolContext } from "@opencode/plugin/promise/tool"
-import { coreCall, isCoreAvailable, shutdownCore } from "./core-client.js"
+import { coreCall, getBridgeCoreID, isCoreAvailable, setBridgeCoreID, shutdownCore } from "./core-client.js"
 import { fingerprintSendRequest, stableMessageID } from "./idempotency.js"
 import {
   createProvenance,
@@ -235,6 +235,7 @@ export function createSessionBridge(options: SessionBridgeOptions = {}): Plugin.
   return definePlugin({
     id: "opencode-session-bridge",
     setup: async (ctx) => {
+      setBridgeCoreID(crypto.randomUUID())
       const now = options.now ?? Date.now
       const customMessageID = options.newMessageID !== undefined
       const newMessageID =
@@ -511,7 +512,9 @@ export function createSessionBridge(options: SessionBridgeOptions = {}): Plugin.
         const input = parseSessionSendInput(raw, context.sessionID)
         // A task handoff never waits for the target. The target reports back
         // through the completion callback instead of being polled.
-        const isTask = input.intent === "task"
+        // A conversationID is the handoff contract. Any intent may carry it,
+        // so a custom intent cannot silently lose the completion callback.
+        const isTask = input.conversationID !== undefined
         const waitForReply = isTask ? false : input.waitForReply
         const delivery = waitForReply ? "steer" : input.delivery
         const normalized = { ...input, delivery, waitForReply }
@@ -1066,6 +1069,7 @@ export function createSessionBridge(options: SessionBridgeOptions = {}): Plugin.
         disposed = true
         eventController.abort()
         handoffs.clear()
+        if (isCoreAvailable()) void coreCall("handoff_clear", {}).catch(() => {})
         idempotency.clear()
         limiter.clear()
         if (contextHookRegistration) await contextHookRegistration.dispose()
